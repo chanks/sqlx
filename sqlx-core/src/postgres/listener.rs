@@ -8,6 +8,8 @@ use futures_core::future::BoxFuture;
 use futures_core::stream::{BoxStream, Stream};
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 
+use crate::acquire::Acquire;
+use crate::database::Database;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
@@ -211,6 +213,14 @@ impl PgListener {
         }
     }
 
+    pub fn try_recv_buffered(&mut self) -> Option<PgNotification> {
+        if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+            Some(PgNotification(notification))
+        } else {
+            None
+        }
+    }
+
     /// Receives the next notification available from any of the subscribed channels.
     ///
     /// If the connection to PostgreSQL is lost, `None` is returned, and the connection is
@@ -389,6 +399,27 @@ impl<'c> Executor<'c> for &'c mut PgListener {
         'c: 'e,
     {
         async move { self.connection().await?.describe(query).await }.boxed()
+    }
+}
+
+impl<'a> Acquire<'a> for &'a mut PgListener {
+    type Database = crate::postgres::Postgres;
+
+    type Connection = &'a mut <crate::postgres::Postgres as Database>::Connection;
+
+    fn acquire(self) -> BoxFuture<'a, Result<Self::Connection, Error>> {
+        async {
+            let conn = self.connection().await?;
+            Ok(conn)
+        }.boxed()
+    }
+
+    fn begin(self) -> BoxFuture<'a, Result<crate::transaction::Transaction<'a, Self::Database>, Error>> {
+        async {
+            let conn = self.connection().await?;
+            let txn = conn.begin().await?;
+            Ok(txn)
+        }.boxed()
     }
 }
 
