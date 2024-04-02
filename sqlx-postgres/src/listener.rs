@@ -400,23 +400,27 @@ impl<'c> Executor<'c> for &'c mut PgListener {
 }
 
 impl<'a> Acquire<'a> for &'a mut PgListener {
-    type Database = crate::postgres::Postgres;
+    type Database = crate::Postgres;
 
-    type Connection = &'a mut <crate::postgres::Postgres as Database>::Connection;
+    type Connection = &'a mut <crate::Postgres as Database>::Connection;
 
     fn acquire(self) -> BoxFuture<'a, Result<Self::Connection, Error>> {
         async {
             let conn = self.connection().await?;
             Ok(conn)
-        }.boxed()
+        }
+        .boxed()
     }
 
-    fn begin(self) -> BoxFuture<'a, Result<crate::transaction::Transaction<'a, Self::Database>, Error>> {
+    fn begin(
+        self,
+    ) -> BoxFuture<'a, Result<crate::transaction::Transaction<'a, Self::Database>, Error>> {
         async {
             let conn = self.connection().await?;
             let txn = conn.begin().await?;
             Ok(txn)
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
