@@ -1,14 +1,15 @@
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::Executor;
-use std::sync::atomic::AtomicI32;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+    atomic::{AtomicI32, AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 
 #[sqlx_macros::test]
 async fn pool_should_invoke_after_connect() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+
     let counter = Arc::new(AtomicUsize::new(0));
 
     let pool = AnyPoolOptions::new()
@@ -41,6 +42,8 @@ async fn pool_should_invoke_after_connect() -> anyhow::Result<()> {
 // https://github.com/launchbadge/sqlx/issues/527
 #[sqlx_macros::test]
 async fn pool_should_be_returned_failed_transactions() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+
     let pool = AnyPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(3))
@@ -50,17 +53,17 @@ async fn pool_should_be_returned_failed_transactions() -> anyhow::Result<()> {
     let query = "blah blah";
 
     let mut tx = pool.begin().await?;
-    let res = sqlx::query(query).execute(&mut tx).await;
+    let res = sqlx::query(query).execute(&mut *tx).await;
     assert!(res.is_err());
     drop(tx);
 
     let mut tx = pool.begin().await?;
-    let res = sqlx::query(query).execute(&mut tx).await;
+    let res = sqlx::query(query).execute(&mut *tx).await;
     assert!(res.is_err());
     drop(tx);
 
     let mut tx = pool.begin().await?;
-    let res = sqlx::query(query).execute(&mut tx).await;
+    let res = sqlx::query(query).execute(&mut *tx).await;
     assert!(res.is_err());
     drop(tx);
 
@@ -69,6 +72,8 @@ async fn pool_should_be_returned_failed_transactions() -> anyhow::Result<()> {
 
 #[sqlx_macros::test]
 async fn test_pool_callbacks() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+
     #[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
     struct ConnStats {
         id: i32,
@@ -110,7 +115,7 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
                     CREATE TEMPORARY TABLE conn_stats(
                         id int primary key,
                         before_acquire_calls int default 0,
-                        after_release_calls int default 0 
+                        after_release_calls int default 0
                     );
                     INSERT INTO conn_stats(id) VALUES ({});
                     "#,
@@ -131,7 +136,7 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
                 // MySQL and MariaDB don't support UPDATE ... RETURNING
                 sqlx::query(
                     r#"
-                        UPDATE conn_stats 
+                        UPDATE conn_stats
                         SET before_acquire_calls = before_acquire_calls + 1
                     "#,
                 )
@@ -155,7 +160,7 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
             Box::pin(async move {
                 sqlx::query(
                     r#"
-                        UPDATE conn_stats 
+                        UPDATE conn_stats
                         SET after_release_calls = after_release_calls + 1
                     "#,
                 )
@@ -207,6 +212,69 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
     }
 
     pool.close().await;
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn test_connection_maintenance() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+    sqlx_test::setup_if_needed();
+    let conn_options: AnyConnectOptions = std::env::var("DATABASE_URL")?.parse()?;
+
+    let last_meta = Arc::new(Mutex::new(None));
+    let last_meta_ = last_meta.clone();
+    let pool = AnyPoolOptions::new()
+        .max_lifetime(Duration::from_millis(400))
+        .min_connections(3)
+        .before_acquire(move |_conn, _meta| {
+            *last_meta_.lock().unwrap() = Some(_meta);
+            Box::pin(async { Ok(true) })
+        })
+        .connect_lazy_with(conn_options);
+
+    // Open and release 5 connections
+    let conns = vec![
+        pool.acquire().await?,
+        pool.acquire().await?,
+        pool.acquire().await?,
+        pool.acquire().await?,
+        pool.acquire().await?,
+    ];
+    assert_eq!(pool.size(), 5);
+    assert_eq!(pool.num_idle(), 0);
+    for mut conn in conns {
+        conn.return_to_pool().await;
+    }
+
+    assert_eq!(pool.size(), 5);
+    assert_eq!(pool.num_idle(), 5);
+
+    // Wait for at least two iterations of maintenance task
+    sqlx_core::rt::sleep(Duration::from_secs(1)).await;
+
+    // Existing connections should have been closed due to max lifetime
+    // and the pool should have reopened min_connections new ones.
+    // One connection might be in the process of being replaced so we assert 2-3.
+    assert!(
+        pool.size() >= 2 && pool.size() <= 3,
+        "pool.size() = {}",
+        pool.size()
+    );
+    for _ in 0..2 {
+        // Check that the connections was both acquired from the pool AND it's new
+        let _ = pool.acquire().await.expect("failed to acquire connection");
+        let meta = last_meta
+            .lock()
+            .unwrap()
+            .take()
+            .expect("expected a connection from the pool");
+        assert!(
+            meta.age < Duration::from_secs(1),
+            "expected a fresh connection (age {:?})",
+            meta.age
+        );
+    }
 
     Ok(())
 }

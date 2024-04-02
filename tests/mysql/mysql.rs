@@ -238,6 +238,57 @@ async fn it_caches_statements() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
+async fn it_closes_statements_with_persistent_disabled() -> anyhow::Result<()> {
+    let mut conn = new::<MySql>().await?;
+
+    let old_statement_count = select_statement_count(&mut conn).await.unwrap_or_default();
+
+    for i in 0..2 {
+        let row = sqlx::query("SELECT ? AS val")
+            .bind(i)
+            .persistent(false)
+            .fetch_one(&mut conn)
+            .await?;
+
+        let val: i32 = row.get("val");
+
+        assert_eq!(i, val);
+    }
+
+    let new_statement_count = select_statement_count(&mut conn).await.unwrap_or_default();
+
+    assert_eq!(old_statement_count, new_statement_count);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_closes_statements_with_cache_disabled() -> anyhow::Result<()> {
+    setup_if_needed();
+
+    let mut url = url::Url::parse(&env::var("DATABASE_URL")?)?;
+    url.query_pairs_mut()
+        .append_pair("statement-cache-capacity", "0");
+
+    let mut conn = MySqlConnection::connect(url.as_ref()).await?;
+
+    let old_statement_count = select_statement_count(&mut conn).await.unwrap_or_default();
+
+    for index in 1..=10_i32 {
+        let _ = sqlx::query("SELECT ?")
+            .bind(index)
+            .execute(&mut conn)
+            .await?;
+    }
+
+    let new_statement_count = select_statement_count(&mut conn).await.unwrap_or_default();
+
+    assert_eq!(old_statement_count, new_statement_count);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn it_can_bind_null_and_non_null_issue_540() -> anyhow::Result<()> {
     let mut conn = new::<MySql>().await?;
 
@@ -276,7 +327,7 @@ async fn it_can_bind_only_null_issue_540() -> anyhow::Result<()> {
 async fn it_can_bind_and_return_years() -> anyhow::Result<()> {
     let mut conn = new::<MySql>().await?;
 
-    conn.execute(
+    sqlx::raw_sql(
         r#"
 CREATE TEMPORARY TABLE too_many_years (
     id INT PRIMARY KEY AUTO_INCREMENT,
@@ -284,6 +335,7 @@ CREATE TEMPORARY TABLE too_many_years (
 );
     "#,
     )
+    .execute(&mut conn)
     .await?;
 
     sqlx::query(
@@ -310,7 +362,7 @@ async fn it_can_prepare_then_execute() -> anyhow::Result<()> {
     let mut tx = conn.begin().await?;
 
     let tweet_id: u64 = sqlx::query("INSERT INTO tweet ( text ) VALUES ( 'Hello, World' )")
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?
         .last_insert_id();
 
@@ -326,7 +378,7 @@ async fn it_can_prepare_then_execute() -> anyhow::Result<()> {
     assert_eq!(statement.column(2).type_info().name(), "TEXT");
     assert_eq!(statement.column(3).type_info().name(), "BIGINT");
 
-    let row = statement.query().bind(tweet_id).fetch_one(&mut tx).await?;
+    let row = statement.query().bind(tweet_id).fetch_one(&mut *tx).await?;
     let tweet_text: &str = row.try_get("text")?;
 
     assert_eq!(tweet_text, "Hello, World");
@@ -347,7 +399,7 @@ async fn test_issue_622() -> anyhow::Result<()> {
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await?;
 
-    println!("pool state: {:?}", pool);
+    println!("pool state: {pool:?}");
 
     let mut handles = vec![];
 
@@ -355,18 +407,18 @@ async fn test_issue_622() -> anyhow::Result<()> {
     for i in 0..3 {
         let pool = pool.clone();
 
-        handles.push(sqlx_rt::spawn(async move {
+        handles.push(sqlx_core::rt::spawn(async move {
             {
                 let mut conn = pool.acquire().await.unwrap();
 
-                let _ = sqlx::query("SELECT 1").fetch_one(&mut conn).await.unwrap();
+                let _ = sqlx::query("SELECT 1").fetch_one(&mut *conn).await.unwrap();
 
                 // conn gets dropped here and should be returned to the pool
             }
 
             // (do some other work here without holding on to a connection)
             // this actually fixes the issue, depending on the timeout used
-            // sqlx_rt::sleep(Duration::from_millis(500)).await;
+            // sqlx_core::rt::sleep(Duration::from_millis(500)).await;
 
             {
                 let start = Instant::now();
@@ -375,7 +427,7 @@ async fn test_issue_622() -> anyhow::Result<()> {
                         println!("{} acquire took {:?}", i, start.elapsed());
                         drop(conn);
                     }
-                    Err(e) => panic!("{} acquire returned error: {} pool state: {:?}", i, e, pool),
+                    Err(e) => panic!("{i} acquire returned error: {e} pool state: {pool:?}"),
                 }
             }
 
@@ -391,7 +443,8 @@ async fn test_issue_622() -> anyhow::Result<()> {
 #[sqlx_macros::test]
 async fn it_can_work_with_transactions() -> anyhow::Result<()> {
     let mut conn = new::<MySql>().await?;
-    conn.execute("CREATE TEMPORARY TABLE users (id INTEGER PRIMARY KEY);")
+    sqlx::raw_sql("CREATE TEMPORARY TABLE users (id INTEGER PRIMARY KEY);")
+        .execute(&mut conn)
         .await?;
 
     // begin .. rollback
@@ -399,10 +452,10 @@ async fn it_can_work_with_transactions() -> anyhow::Result<()> {
     let mut tx = conn.begin().await?;
     sqlx::query("INSERT INTO users (id) VALUES (?)")
         .bind(1_i32)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&mut tx)
+        .fetch_one(&mut *tx)
         .await?;
     assert_eq!(count, 1);
     tx.rollback().await?;
@@ -416,7 +469,7 @@ async fn it_can_work_with_transactions() -> anyhow::Result<()> {
     let mut tx = conn.begin().await?;
     sqlx::query("INSERT INTO users (id) VALUES (?)")
         .bind(1_i32)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
     tx.commit().await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
@@ -431,10 +484,10 @@ async fn it_can_work_with_transactions() -> anyhow::Result<()> {
 
         sqlx::query("INSERT INTO users (id) VALUES (?)")
             .bind(2)
-            .execute(&mut tx)
+            .execute(&mut *tx)
             .await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&mut tx)
+            .fetch_one(&mut *tx)
             .await?;
         assert_eq!(count, 2);
         // tx is dropped
@@ -445,4 +498,83 @@ async fn it_can_work_with_transactions() -> anyhow::Result<()> {
     assert_eq!(count, 1);
 
     Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_can_handle_split_packets() -> anyhow::Result<()> {
+    // This will only take effect on new connections
+    new::<MySql>()
+        .await?
+        .execute("SET GLOBAL max_allowed_packet = 4294967297")
+        .await?;
+
+    let mut conn = new::<MySql>().await?;
+
+    conn.execute(
+        r#"
+CREATE TEMPORARY TABLE large_table (data LONGBLOB);
+        "#,
+    )
+    .await?;
+
+    let data = vec![0x41; 0xFF_FF_FF * 2];
+
+    sqlx::query("INSERT INTO large_table (data) VALUES (?)")
+        .bind(&data)
+        .execute(&mut conn)
+        .await?;
+
+    let ret: Vec<u8> = sqlx::query_scalar("SELECT * FROM large_table")
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(ret, data);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn test_shrink_buffers() -> anyhow::Result<()> {
+    // We don't really have a good way to test that `.shrink_buffers()` functions as expected
+    // without exposing a lot of internals, but we can at least be sure it doesn't
+    // materially affect the operation of the connection.
+
+    let mut conn = new::<MySql>().await?;
+
+    // The connection buffer is only 8 KiB by default so this should definitely force it to grow.
+    let data = "This string should be 32 bytes!\n".repeat(1024);
+    assert_eq!(data.len(), 32 * 1024);
+
+    let ret: String = sqlx::query_scalar("SELECT ?")
+        .bind(&data)
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(ret, data);
+
+    conn.shrink_buffers();
+
+    let ret: i64 = sqlx::query_scalar("SELECT ?")
+        .bind(&12345678i64)
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(ret, 12345678i64);
+
+    Ok(())
+}
+
+async fn select_statement_count(conn: &mut MySqlConnection) -> Result<i64, sqlx::Error> {
+    // Fails if performance schema does not exist
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM performance_schema.threads AS t
+        INNER JOIN performance_schema.prepared_statements_instances AS psi
+            ON psi.OWNER_THREAD_ID = t.THREAD_ID 
+        WHERE t.processlist_id = CONNECTION_ID()
+        "#,
+    )
+    .fetch_one(conn)
+    .await
 }
