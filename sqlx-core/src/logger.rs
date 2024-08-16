@@ -54,6 +54,12 @@ pub fn private_level_filter_to_levels(
     tracing_level.zip(filter.to_level())
 }
 
+pub(crate) fn private_level_filter_to_trace_level(
+    filter: log::LevelFilter,
+) -> Option<tracing::Level> {
+    private_level_filter_to_levels(filter).map(|(level, _)| level)
+}
+
 pub use sqlformat;
 
 pub struct QueryLogger<'q> {
@@ -100,14 +106,14 @@ impl<'q> QueryLogger<'q> {
             let log_is_enabled = log::log_enabled!(target: "sqlx::query", log_level)
                 || private_tracing_dynamic_enabled!(target: "sqlx::query", tracing_level);
             if log_is_enabled {
-                let mut summary = parse_query_summary(&self.sql);
+                let mut summary = parse_query_summary(self.sql);
 
                 let sql = if summary != self.sql {
                     summary.push_str(" …");
                     format!(
                         "\n\n{}\n",
                         sqlformat::format(
-                            &self.sql,
+                            self.sql,
                             &sqlformat::QueryParams::None,
                             sqlformat::FormatOptions::default()
                         )

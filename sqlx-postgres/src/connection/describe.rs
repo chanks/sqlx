@@ -4,12 +4,13 @@ use crate::message::{ParameterDescription, RowDescription};
 use crate::query_as::query_as;
 use crate::query_scalar::{query_scalar, query_scalar_with};
 use crate::statement::PgStatementMetadata;
-use crate::type_info::{PgCustomType, PgType, PgTypeKind};
+use crate::type_info::{PgArrayOf, PgCustomType, PgType, PgTypeKind};
 use crate::types::Json;
 use crate::types::Oid;
 use crate::HashMap;
 use crate::{PgArguments, PgColumn, PgConnection, PgTypeInfo};
 use futures_core::future::BoxFuture;
+use smallvec::SmallVec;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -185,8 +186,24 @@ impl PgConnection {
 
     fn fetch_type_by_oid(&mut self, oid: Oid) -> BoxFuture<'_, Result<PgTypeInfo, Error>> {
         Box::pin(async move {
-            let (name, typ_type, category, relation_id, element, base_type): (String, i8, i8, Oid, Oid, Oid) = query_as(
-                "SELECT typname, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1",
+            let (name, typ_type, category, relation_id, element, base_type): (
+                String,
+                i8,
+                i8,
+                Oid,
+                Oid,
+                Oid,
+            ) = query_as(
+                // Converting the OID to `regtype` and then `text` will give us the name that
+                // the type will need to be found at by search_path.
+                "SELECT oid::regtype::text, \
+                     typtype, \
+                     typcategory, \
+                     typrelid, \
+                     typelem, \
+                     typbasetype \
+                     FROM pg_catalog.pg_type \
+                     WHERE oid = $1",
             )
             .bind(oid)
             .fetch_one(&mut *self)
@@ -338,6 +355,19 @@ WHERE rngtypid = $1
         })
     }
 
+    pub(crate) async fn resolve_type_id(&mut self, ty: &PgType) -> Result<Oid, Error> {
+        if let Some(oid) = ty.try_oid() {
+            return Ok(oid);
+        }
+
+        match ty {
+            PgType::DeclareWithName(name) => self.fetch_type_id_by_name(name).await,
+            PgType::DeclareArrayOf(array) => self.fetch_array_type_id(array).await,
+            // `.try_oid()` should return `Some()` or it should be covered here
+            _ => unreachable!("(bug) OID should be resolvable for type {ty:?}"),
+        }
+    }
+
     pub(crate) async fn fetch_type_id_by_name(&mut self, name: &str) -> Result<Oid, Error> {
         if let Some(oid) = self.cache_type_oid.get(name) {
             return Ok(*oid);
@@ -349,11 +379,39 @@ WHERE rngtypid = $1
             .fetch_optional(&mut *self)
             .await?
             .ok_or_else(|| Error::TypeNotFound {
-                type_name: String::from(name),
+                type_name: name.into(),
             })?;
 
         self.cache_type_oid.insert(name.to_string().into(), oid);
         Ok(oid)
+    }
+
+    pub(crate) async fn fetch_array_type_id(&mut self, array: &PgArrayOf) -> Result<Oid, Error> {
+        if let Some(oid) = self
+            .cache_type_oid
+            .get(&array.elem_name)
+            .and_then(|elem_oid| self.cache_elem_type_to_array.get(elem_oid))
+        {
+            return Ok(*oid);
+        }
+
+        // language=SQL
+        let (elem_oid, array_oid): (Oid, Oid) =
+            query_as("SELECT oid, typarray FROM pg_catalog.pg_type WHERE oid = $1::regtype::oid")
+                .bind(&*array.elem_name)
+                .fetch_optional(&mut *self)
+                .await?
+                .ok_or_else(|| Error::TypeNotFound {
+                    type_name: array.name.to_string(),
+                })?;
+
+        // Avoids copying `elem_name` until necessary
+        self.cache_type_oid
+            .entry_ref(&array.elem_name)
+            .insert(elem_oid);
+        self.cache_elem_type_to_array.insert(elem_oid, array_oid);
+
+        Ok(array_oid)
     }
 
     pub(crate) async fn get_nullable_for_columns(
@@ -381,9 +439,10 @@ WHERE rngtypid = $1
                 bind + 2
             );
 
-            args.add(i as i32);
-            args.add(column.relation_id);
-            args.add(column.relation_attribute_no);
+            args.add(i as i32).map_err(Error::Encode)?;
+            args.add(column.relation_id).map_err(Error::Encode)?;
+            args.add(column.relation_attribute_no)
+                .map_err(Error::Encode)?;
         }
 
         nullable_query.push_str(
@@ -447,17 +506,18 @@ WHERE rngtypid = $1
             explain += ")";
         }
 
-        let (Json([explain]),): (Json<[Explain; 1]>,) = query_as(&explain).fetch_one(self).await?;
+        let (Json(explains),): (Json<SmallVec<[Explain; 1]>>,) =
+            query_as(&explain).fetch_one(self).await?;
 
         let mut nullables = Vec::new();
 
-        if let Explain::Plan {
+        if let Some(Explain::Plan {
             plan:
                 plan @ Plan {
                     output: Some(ref outputs),
                     ..
                 },
-        } = &explain
+        }) = explains.first()
         {
             nullables.resize(outputs.len(), None);
             visit_plan(plan, outputs, &mut nullables);
