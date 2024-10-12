@@ -11,7 +11,8 @@ use crate::error::{Error, Result};
 use crate::ext::async_stream::TryAsyncStream;
 use crate::io::AsyncRead;
 use crate::message::{
-    CommandComplete, CopyData, CopyDone, CopyFail, CopyResponse, MessageFormat, Query,
+    BackendMessageFormat, CommandComplete, CopyData, CopyDone, CopyFail, CopyInResponse,
+    CopyOutResponse, CopyResponseData, Query, ReadyForQuery,
 };
 use crate::pool::{Pool, PoolConnection};
 use crate::Postgres;
@@ -138,18 +139,18 @@ impl PgPoolCopyExt for Pool<Postgres> {
 #[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
 pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
     conn: Option<C>,
-    response: CopyResponse,
+    response: CopyResponseData,
 }
 
 impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     async fn begin(mut conn: C, statement: &str) -> Result<Self> {
         conn.wait_until_ready().await?;
-        conn.stream.send(Query(statement)).await?;
+        conn.inner.stream.send(Query(statement)).await?;
 
-        let response = match conn.stream.recv_expect(MessageFormat::CopyInResponse).await {
-            Ok(res) => res,
+        let response = match conn.inner.stream.recv_expect::<CopyInResponse>().await {
+            Ok(res) => res.0,
             Err(e) => {
-                conn.stream.recv().await?;
+                conn.inner.stream.recv().await?;
                 return Err(e);
             }
         };
@@ -168,7 +169,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// Returns the number of columns expected in the input.
     pub fn num_columns(&self) -> usize {
         assert_eq!(
-            self.response.num_columns as usize,
+            self.response.num_columns.unsigned_abs() as usize,
             self.response.format_codes.len(),
             "num_columns does not match format_codes.len()"
         );
@@ -190,6 +191,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         self.conn
             .as_deref_mut()
             .expect("send_data: conn taken")
+            .inner
             .stream
             .send(CopyData(data))
             .await?;
@@ -214,7 +216,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
         let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
         loop {
-            let buf = conn.stream.write_buffer_mut();
+            let buf = conn.inner.stream.write_buffer_mut();
 
             // Write the CopyData format code and reserve space for the length.
             // This may end up sending an empty `CopyData` packet if, after this point,
@@ -233,7 +235,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 
             (&mut buf.get_mut()[1..]).put_u32(read32 + 4);
 
-            conn.stream.flush().await?;
+            conn.inner.stream.flush().await?;
         }
 
         Ok(self)
@@ -250,9 +252,9 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
             .take()
             .expect("PgCopyIn::fail_with: conn taken illegally");
 
-        conn.stream.send(CopyFail::new(msg)).await?;
+        conn.inner.stream.send(CopyFail::new(msg)).await?;
 
-        match conn.stream.recv().await {
+        match conn.inner.stream.recv().await {
             Ok(msg) => Err(err_protocol!(
                 "fail_with: expected ErrorResponse, got: {:?}",
                 msg.format
@@ -261,9 +263,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 match e.code() {
                     Some(Cow::Borrowed("57014")) => {
                         // postgres abort received error code
-                        conn.stream
-                            .recv_expect(MessageFormat::ReadyForQuery)
-                            .await?;
+                        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
                         Ok(())
                     }
                     _ => Err(Error::Database(e)),
@@ -282,22 +282,16 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
             .take()
             .expect("CopyWriter::finish: conn taken illegally");
 
-        conn.stream.send(CopyDone).await?;
-        let cc: CommandComplete = match conn
-            .stream
-            .recv_expect(MessageFormat::CommandComplete)
-            .await
-        {
+        conn.inner.stream.send(CopyDone).await?;
+        let cc: CommandComplete = match conn.inner.stream.recv_expect().await {
             Ok(cc) => cc,
             Err(e) => {
-                conn.stream.recv().await?;
+                conn.inner.stream.recv().await?;
                 return Err(e);
             }
         };
 
-        conn.stream
-            .recv_expect(MessageFormat::ReadyForQuery)
-            .await?;
+        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
 
         Ok(cc.rows_affected())
     }
@@ -306,9 +300,12 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
     fn drop(&mut self) {
         if let Some(mut conn) = self.conn.take() {
-            conn.stream.write(CopyFail::new(
-                "PgCopyIn dropped without calling finish() or fail()",
-            ));
+            conn.inner
+                .stream
+                .write_msg(CopyFail::new(
+                    "PgCopyIn dropped without calling finish() or fail()",
+                ))
+                .expect("BUG: PgCopyIn abort message should not be too large");
         }
     }
 }
@@ -318,26 +315,23 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
     statement: &str,
 ) -> Result<BoxStream<'c, Result<Bytes>>> {
     conn.wait_until_ready().await?;
-    conn.stream.send(Query(statement)).await?;
+    conn.inner.stream.send(Query(statement)).await?;
 
-    let _: CopyResponse = conn
-        .stream
-        .recv_expect(MessageFormat::CopyOutResponse)
-        .await?;
+    let _: CopyOutResponse = conn.inner.stream.recv_expect().await?;
 
     let stream: TryAsyncStream<'c, Bytes> = try_stream! {
         loop {
-            match conn.stream.recv().await {
+            match conn.inner.stream.recv().await {
                 Err(e) => {
-                    conn.stream.recv_expect(MessageFormat::ReadyForQuery).await?;
+                    conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
                     return Err(e);
                 },
                 Ok(msg) => match msg.format {
-                    MessageFormat::CopyData => r#yield!(msg.decode::<CopyData<Bytes>>()?.0),
-                    MessageFormat::CopyDone => {
+                    BackendMessageFormat::CopyData => r#yield!(msg.decode::<CopyData<Bytes>>()?.0),
+                    BackendMessageFormat::CopyDone => {
                         let _ = msg.decode::<CopyDone>()?;
-                        conn.stream.recv_expect(MessageFormat::CommandComplete).await?;
-                        conn.stream.recv_expect(MessageFormat::ReadyForQuery).await?;
+                        conn.inner.stream.recv_expect::<CommandComplete>().await?;
+                        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
                         return Ok(())
                     },
                     _ => return Err(err_protocol!("unexpected message format during copy out: {:?}", msg.format))

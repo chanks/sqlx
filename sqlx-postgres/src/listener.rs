@@ -13,7 +13,7 @@ use crate::database::Database;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
-use crate::message::{MessageFormat, Notification};
+use crate::message::{BackendMessageFormat, Notification};
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
 use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
@@ -60,7 +60,7 @@ impl PgListener {
 
         // Setup a notification buffer
         let (sender, receiver) = mpsc::unbounded();
-        connection.stream.notifications = Some(sender);
+        connection.inner.stream.notifications = Some(sender);
 
         Ok(Self {
             pool: pool.clone(),
@@ -157,7 +157,7 @@ impl PgListener {
     async fn connect_if_needed(&mut self) -> Result<(), Error> {
         if self.connection.is_none() {
             let mut connection = self.pool.acquire().await?;
-            connection.stream.notifications = self.buffer_tx.take();
+            connection.inner.stream.notifications = self.buffer_tx.take();
 
             connection
                 .execute(&*build_listen_all_query(&self.channels))
@@ -190,19 +190,17 @@ impl PgListener {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use sqlx_core::postgres::PgListener;
-    /// # use sqlx_core::error::Error;
+    /// # use sqlx::postgres::PgListener;
     /// #
-    /// # #[cfg(feature = "_rt")]
     /// # sqlx::__rt::test_block_on(async move {
-    /// # let mut listener = PgListener::connect("postgres:// ...").await?;
+    /// let mut listener = PgListener::connect("postgres:// ...").await?;
     /// loop {
     ///     // ask for next notification, re-connecting (transparently) if needed
     ///     let notification = listener.recv().await?;
     ///
     ///     // handle notification, do something interesting
     /// }
-    /// # Result::<(), Error>::Ok(())
+    /// # Result::<(), sqlx::Error>::Ok(())
     /// # }).unwrap();
     /// ```
     pub async fn recv(&mut self) -> Result<PgNotification, Error> {
@@ -229,10 +227,8 @@ impl PgListener {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use sqlx_core::postgres::PgListener;
-    /// # use sqlx_core::error::Error;
+    /// # use sqlx::postgres::PgListener;
     /// #
-    /// # #[cfg(feature = "_rt")]
     /// # sqlx::__rt::test_block_on(async move {
     /// # let mut listener = PgListener::connect("postgres:// ...").await?;
     /// loop {
@@ -243,7 +239,7 @@ impl PgListener {
     ///
     ///     // connection lost, do something interesting
     /// }
-    /// # Result::<(), Error>::Ok(())
+    /// # Result::<(), sqlx::Error>::Ok(())
     /// # }).unwrap();
     /// ```
     pub async fn try_recv(&mut self) -> Result<Option<PgNotification>, Error> {
@@ -257,7 +253,7 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let next_message = self.connection().await?.stream.recv_unchecked();
+            let next_message = self.connection().await?.inner.stream.recv_unchecked();
 
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
@@ -276,8 +272,11 @@ impl PgListener {
                     if (err.kind() == io::ErrorKind::ConnectionAborted
                         || err.kind() == io::ErrorKind::UnexpectedEof) =>
                 {
-                    self.buffer_tx = self.connection().await?.stream.notifications.take();
-                    self.connection = None;
+                    if let Some(mut conn) = self.connection.take() {
+                        self.buffer_tx = conn.inner.stream.notifications.take();
+                        // Close the connection in a background task, so we can continue.
+                        conn.close_on_drop();
+                    }
 
                     // lost connection
                     return Ok(None);
@@ -291,13 +290,13 @@ impl PgListener {
 
             match message.format {
                 // We've received an async notification, return it.
-                MessageFormat::NotificationResponse => {
+                BackendMessageFormat::NotificationResponse => {
                     return Ok(Some(PgNotification(message.decode()?)));
                 }
 
                 // Mark the connection as ready for another query
-                MessageFormat::ReadyForQuery => {
-                    self.connection().await?.pending_ready_for_query_count -= 1;
+                BackendMessageFormat::ReadyForQuery => {
+                    self.connection().await?.inner.pending_ready_for_query_count -= 1;
                 }
 
                 // Ignore unexpected messages
